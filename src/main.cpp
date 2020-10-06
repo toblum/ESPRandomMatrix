@@ -47,7 +47,7 @@ uint8_t anim_index = 0;
 
 // This defines the 'on' time of the display is us. The larger this number,
 // the brighter the display. If too large the ESP will crash
-uint8_t display_draw_time = 1; //30-60 is usually fine
+uint8_t display_draw_time = 40; //30-60 is usually fine
 
 //PxMATRIX display(32,16,P_LAT, P_OE,P_A,P_B,P_C);
 //PxMATRIX display(64,32,P_LAT, P_OE,P_A,P_B,P_C,P_D);
