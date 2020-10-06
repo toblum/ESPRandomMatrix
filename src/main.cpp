@@ -1,3 +1,18 @@
+/*
+	Copyright (c) 2020 Tobias Blum. All rights reserved.
+
+	ESPRandomMatrix - Random animations, images and more on a RGB led matrix
+	https://github.com/toblum/ArduinoMSGraph
+
+	This Source Code Form is subject to the terms of the Mozilla Public
+	License, v. 2.0. If a copy of the MPL was not distributed with this
+	file, You can obtain one at https://mozilla.org/MPL/2.0/.
+*/
+
+// ***************************************************
+// * Initialize PxMatrix
+// ***************************************************
+
 // This is how many color levels the display shows - the more the slower the update
 //#define PxMATRIX_COLOR_DEPTH 4
 
@@ -39,7 +54,7 @@ Ticker display_ticker;
 
 unsigned long ms_current = 0;
 unsigned long ms_previous = 0;
-unsigned long ms_animation_max_duration = 10000; // 10 seconds
+unsigned long ms_animation_max_duration = 20 * 1000; // 20 seconds
 unsigned long next_frame = 0;
 
 uint8_t mode = 0;
@@ -55,7 +70,7 @@ PxMATRIX display(64, 32, P_LAT, P_OE, P_A, P_B, P_C, P_D, P_E);
 
 #include <FastLED.h> // Aurora needs fastled
 
-#include "anim_data.h"
+#include "AnimData.h"
 #include "Effects.h"
 Effects effects;
 
@@ -66,148 +81,45 @@ Effects effects;
 #include "Patterns.h"
 Patterns patterns;
 
-// Some standard colors
-uint16_t myRED = display.color565(255, 0, 0);
-uint16_t myGREEN = display.color565(0, 255, 0);
-uint16_t myBLUE = display.color565(0, 0, 255);
-uint16_t myWHITE = display.color565(255, 255, 255);
-uint16_t myYELLOW = display.color565(255, 255, 0);
-uint16_t myCYAN = display.color565(0, 255, 255);
-uint16_t myMAGENTA = display.color565(255, 0, 255);
-uint16_t myBLACK = display.color565(0, 0, 0);
 
-uint16_t myCOLORS[8] = {myRED, myGREEN, myBLUE, myWHITE, myYELLOW, myCYAN, myMAGENTA, myBLACK};
+// ***************************************************
+// * Initialize WiFi / NTP / Tetris Clock
+// ***************************************************
+#include "../_credentials.h"
+#include <WiFi.h>
+#include <TetrisMatrixDraw.h>
+#include <ezTime.h>
 
-#ifdef ESP8266
-// ISR for display refresh
-void display_updater()
-{
-	display.display(display_draw_time);
-}
-#endif
+#define double_buffer true
 
-#ifdef ESP32
-void IRAM_ATTR display_updater()
-{
-	// Increment the counter and set the time of ISR
-	portENTER_CRITICAL_ISR(&timerMux);
-	display.display(display_draw_time);
-	portEXIT_CRITICAL_ISR(&timerMux);
-}
-#endif
+// Set a timezone using the following list
+// https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+#define MYTIMEZONE "Europe/Berlin"
 
-void display_update_enable(bool is_enable)
-{
-#ifdef ESP8266
-	if (is_enable)
-		display_ticker.attach(0.001, display_updater);
-	else
-		display_ticker.detach();
-#endif
+// Sets whether the clock should be 12 hour format or not.
+bool twelveHourFormat = false;
+// If true, every minute, all numbers are redrawn
+bool forceRefresh = true;
 
-#ifdef ESP32
-	if (is_enable)
-	{
-		timer = timerBegin(0, 80, true);
-		timerAttachInterrupt(timer, &display_updater, true);
-		timerAlarmWrite(timer, 2000, true);
-		timerAlarmEnable(timer);
-	}
-	else
-	{
-		timerDetachInterrupt(timer);
-		timerAlarmDisable(timer);
-	}
-#endif
-}
+hw_timer_t *animationTimer = NULL;
+TetrisMatrixDraw tetris(display);  // Main clock
+TetrisMatrixDraw tetris2(display); // The "M" of AM/PM
+TetrisMatrixDraw tetris3(display); // The "P" or "A" of AM/PM
+
+Timezone myTZ;
+
+unsigned long oneSecondLoopDue = 0;
+bool showColon = true;
+volatile bool finishedAnimating = false;
+
+String lastDisplayedTime = "";
+String lastDisplayedAmPm = "";
 
 
-/*****************************************************
- * Aurora animations
- *****************************************************/
-void listPatterns()
-{
-	patterns.listPatterns();
-}
-
-unsigned long last_draw = 0;
-void scroll_text(uint8_t ypos, unsigned long scroll_delay, String text, uint8_t colorR, uint8_t colorG, uint8_t colorB)
-{
-	uint16_t text_length = text.length();
-	display.setTextWrap(false); // we don't wrap text so it scrolls nicely
-	display.setTextSize(1);
-	display.setRotation(0);
-	display.setTextColor(display.color565(colorR, colorG, colorB));
-
-	// Asuming 5 pixel average character width
-	for (int xpos = MATRIX_WIDTH; xpos > -(MATRIX_WIDTH + text_length * 5); xpos--)
-	{
-		display.setTextColor(display.color565(colorR, colorG, colorB));
-		display.clearDisplay();
-		display.setCursor(xpos, ypos);
-		display.println(text);
-		delay(scroll_delay);
-		yield();
-
-		// This might smooth the transition a bit if we go slow
-		// display.setTextColor(display.color565(colorR/4,colorG/4,colorB/4));
-		// display.setCursor(xpos-1,ypos);
-		// display.println(text);
-
-		delay(scroll_delay / 5);
-		yield();
-	}
-}
-
-
-/*****************************************************
- * Image mode
- *****************************************************/
-#define RGB 565
-#if RGB == 565
-#define frame_size MATRIX_WIDTH *MATRIX_HEIGHT * 2
-#else
-#define frame_size MATRIX_WIDTH *MATRIX_HEIGHT * 3
-#endif
-
-uint8_t line_buffer[MATRIX_WIDTH * 2];
-unsigned long anim_offset = 0;
-uint16_t frame_no = 0;
-union single_double
-{
-	uint8_t two[2];
-	uint16_t one;
-} this_single_double;
-
-// This draws the pixel animation to the frame buffer in animation view
-void draw_image()
-{
-	unsigned long frame_offset = anim_offset + frame_no * frame_size;
-
-	for (int yy = 0; yy < MATRIX_HEIGHT; yy++)
-	{
-		memcpy_P(line_buffer, animations + frame_offset + yy * MATRIX_WIDTH * 2, MATRIX_WIDTH * 2);
-		for (int xx = 0; xx < MATRIX_WIDTH; xx++)
-		{
-			this_single_double.two[0] = line_buffer[xx * 2];
-			this_single_double.two[1] = line_buffer[xx * 2 + 1];
-
-			display.drawPixelRGB565(xx, yy, this_single_double.one);
-		}
-		yield();
-	}
-}
-
-unsigned long getAnimOffset(uint8_t anim_no)
-{
-	unsigned long offset = 0;
-	for (uint8_t count = 0; count < anim_no; count++)
-	{
-		offset = offset + animation_lengths[count] * frame_size;
-	}
-	//Serial.println("anim_no: " + String(anim_no) + ", length: " + String(animation_lengths[anim_no])+ ", offset: " + String(offset));
-	return offset;
-}
+#include "FunctionsDisplay.h"
+#include "FunctionsTetrisClock.h"
+#include "FunctionsAuroraAnimations.h"
+#include "FunctionsAnimatedImages.h"
 
 
 /*****************************************************
@@ -215,12 +127,37 @@ unsigned long getAnimOffset(uint8_t anim_no)
  *****************************************************/
 void setup()
 {
-
 	Serial.begin(115200);
+
+	/*****************************************************
+	 * Initialize WiFi
+	 *****************************************************/
+	// Attempt to connect to Wifi network:
+	Serial.print("Connecting Wifi: ");
+	Serial.println(ssid);
+
+	// Set WiFi to station mode and disconnect from an AP if it was Previously
+	// connected
+	WiFi.mode(WIFI_STA);
+	WiFi.begin(ssid, password);
+
+	while (WiFi.status() != WL_CONNECTED)
+	{
+		Serial.print(".");
+		delay(500);
+	}
+
+	Serial.println("");
+	Serial.println("WiFi connected");
+	Serial.print("IP address: ");
+	Serial.println(WiFi.localIP());
+
+
+	/*****************************************************
+	 * Initialize display
+	 *****************************************************/
 	// Define your display layout here, e.g. 1/8 step, and optional SPI pins begin(row_pattern, CLK, MOSI, MISO, SS)
 	display.begin(16);
-	display.setMuxDelay(0, 1, 0, 0, 0);
-	display.setFastUpdate(true);
 	//display.begin(8, 14, 13, 12, 4);
 
 	// Define multiplex implemention here {BINARY, STRAIGHT} (default is BINARY)
@@ -236,7 +173,7 @@ void setup()
 	//display.setFlip(true);
 
 	// Helps to reduce display update latency on larger displays
-	//display.setFastUpdate(true);
+	display.setFastUpdate(true);
 
 	// Control the minimum color values that result in an active pixel
 	//display.setColorOffset(5, 5,5);
@@ -249,7 +186,7 @@ void setup()
 
 	// Set the time in microseconds that we pause after selecting each mux channel
 	// (May help if some rows are missing / the mux chip is too slow)
-	//display.setMuxDelay(0,1,0,0,0);
+	display.setMuxDelay(0,1,0,0,0); // Needed for ICN2037 / RUC7258 chipsets, see: https://github.com/2dom/PxMatrix/issues/119
 
 	// Set the number of panels that make up the display area width (default is 1)
 	//display.setPanelsWidth(2);
@@ -262,14 +199,12 @@ void setup()
 
 	//display.setFastUpdate(true);
 	display.clearDisplay();
-	display.setTextColor(myCYAN);
-	display.setCursor(2, 0);
-	display.print("Pixel");
-	display.setTextColor(myMAGENTA);
-	display.setCursor(2, 8);
-	display.print("Time");
 	display_update_enable(true);
 
+
+	/*****************************************************
+	 * Initialize patters for effects
+	 *****************************************************/
 	delay(3000);
 	// setup the effects generator
 	effects.Setup();
@@ -282,23 +217,63 @@ void setup()
 
 	Serial.print("Starting with pattern: ");
 	Serial.println(patterns.getCurrentPatternName());
+
+
+	/*****************************************************
+	 * Initialize tetris clock animations / NTP time
+	 *****************************************************/
+	animationTimer = timerBegin(1, 80, true);
+	timerAttachInterrupt(animationTimer, &animationHandler, true);
+	timerAlarmWrite(animationTimer, 100000, true);
+	timerAlarmEnable(animationTimer);
+
+	tetris.scale = 2;
+
+	// Setup EZ Time
+	setDebug(INFO);
+	waitForSync();
+
+	Serial.println();
+	Serial.println("UTC: " + UTC.dateTime());
+
+	myTZ.setLocation(F(MYTIMEZONE));
+	Serial.print(F("Time in your set timezone: "));
+	Serial.println(myTZ.dateTime());
 }
 
 void loop()
 {
-	// menu.run(mainMenuItems, mainMenuItemCount);
 	ms_current = millis();
 
+	// Handle mode changes:
+	// 0 - Image animations
+	// 1 - Tetris clock
+	// 2 - Aurora animations
 	// Change mode after ms_animation_max_duration
 	if ((ms_current - ms_previous) > ms_animation_max_duration)
 	{
 		uint8_t next_mode = 0;
-		// Aurora animations
+		// Image --> Tetris
 		if (mode == 0)
 		{
-			Serial.println("Change to animation mode");
-			// patterns.moveRandom(1);
+			Serial.println("Change to tetris clock mode");
 
+			next_mode = 1;
+
+			// Update time before animation 
+			setMatrixTime(true);
+			finishedAnimating = false;
+		}
+
+		// Tetris --> Aurora
+		if (mode == 1)
+		{
+			// Stop tetris animations
+			finishedAnimating = true;
+
+			Serial.println("Change to aurora animation mode");
+
+			// patterns.moveRandom(1);
 			patterns.stop();
 			patterns.move(1);
 			patterns.start();
@@ -308,13 +283,14 @@ void loop()
 
 			// Select a random palette as well
 			effects.RandomPalette();
-			next_mode = 1;
+
+			next_mode = 2;
 		}
 
-		if (mode == 1)
+		// Aurora --> Image
+		if (mode == 2)
 		{
 			Serial.println("Change to image mode");
-			next_mode = 0;
 
 			anim_index++;
 			if (anim_index > sizeof(animation_lengths) - 1)
@@ -324,6 +300,8 @@ void loop()
 
 			anim_offset = getAnimOffset(anim_index);
 			frame_no = 0;
+
+			next_mode = 0;
 		}
 
 		mode = next_mode;
@@ -345,8 +323,30 @@ void loop()
 		}
 	}
 
-	// Animation
+	// Tetris clock
 	if (mode == 1)
+	{
+		unsigned long now = millis();
+		if (now > oneSecondLoopDue)
+		{
+			// We can call this often, but it will only
+			// update when it needs to
+			setMatrixTime();
+			showColon = !showColon;
+
+			// To reduce flicker on the screen we stop clearing the screen
+			// when the animation is finished, but we still need the colon to
+			// to blink
+			if (finishedAnimating)
+			{
+				handleColonAfterAnimation();
+			}
+			oneSecondLoopDue = now + 1000;
+		}
+	}
+
+	// Animation
+	if (mode == 2)
 	{
 		if (next_frame < ms_current)
 		{
